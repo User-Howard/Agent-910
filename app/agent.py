@@ -1,4 +1,10 @@
-"""A pydantic-ai agent that helps a team pick a meeting time."""
+"""Pydantic-ai agents.
+
+The bot's entry point is a general conversational assistant. It chats when people
+just want to chat, and treats scheduling a meeting as *one tool it can call* —
+`plan_meeting` — rather than the only thing it ever does. The meeting-planning
+logic lives in its own sub-agent that the tool runs.
+"""
 
 from dataclasses import dataclass
 
@@ -24,20 +30,24 @@ _model = OpenAIResponsesModel(
 
 
 @dataclass
-class MeetingDeps:
-    """Dependencies needed for a single agent run."""
+class Deps:
+    """Dependencies shared by a single agent run and any sub-agents it calls."""
 
     channel: discord.abc.Messageable  # lets tools read further back in the conversation
     trigger_message_id: int  # the message that triggered the bot; skip it when reading
+    conversation: str  # the recent conversation the bot started with
 
+
+# --- Meeting-planning sub-agent -------------------------------------------------
+# Only reached when the assistant decides scheduling is actually wanted.
 
 meeting_agent = Agent(
     _model,
-    deps_type=MeetingDeps,
+    deps_type=Deps,
     instructions=(
         "You help a team schedule a meeting from their chat. Figure out the topic, "
         "who's involved, and any time preferences.\n"
-        "You start with the last 10 messages. If that's not enough, call "
+        "You start with the recent conversation you're given. If that's not enough, call "
         "`read_more_messages` to read a bit further back — just enough, not too much.\n"
         "Once you have a time range, call `find_free_slots` for everyone's common "
         "availability, then suggest 2-3 concrete times with a short reason each. "
@@ -48,7 +58,7 @@ meeting_agent = Agent(
 
 
 @meeting_agent.tool
-async def read_more_messages(ctx: RunContext[MeetingDeps], limit: int) -> str:
+async def read_more_messages(ctx: RunContext[Deps], limit: int) -> str:
     """Read more of this channel's recent messages, newest first.
 
     Call this only when the current conversation isn't enough to decide.
@@ -66,7 +76,7 @@ async def read_more_messages(ctx: RunContext[MeetingDeps], limit: int) -> str:
 
 @meeting_agent.tool
 async def find_free_slots(
-    ctx: RunContext[MeetingDeps],
+    ctx: RunContext[Deps],
     earliest: str,
     latest: str,
     duration_minutes: int,
@@ -87,18 +97,69 @@ async def find_free_slots(
     )
 
 
-async def suggest_meeting_time(
+# --- Top-level conversational assistant ----------------------------------------
+
+assistant_agent = Agent(
+    _model,
+    deps_type=Deps,
+    instructions=(
+        "You're a friendly assistant that lives in a Discord channel and replies when "
+        "someone @-mentions you. Read the room and decide what they want:\n"
+        "- If they're just chatting, asking a question, or being social, chat back "
+        "naturally and briefly.\n"
+        "- If they want to find a time to meet / schedule something, call `plan_meeting` "
+        "and relay its answer.\n"
+        "Don't force meeting-scheduling on a casual conversation. When you're unsure "
+        "whether they want to schedule, just ask.\n"
+        "Reply in the same language as the conversation."
+    ),
+)
+
+
+@assistant_agent.tool
+async def plan_meeting(ctx: RunContext[Deps]) -> str:
+    """Work out good meeting times from the channel conversation.
+
+    Call this when the people in the chat want to schedule or find a time to meet.
+    It reads the conversation (and further back if needed), checks availability, and
+    returns concrete suggested times. Returns that suggestion as text.
+    """
+    result = await meeting_agent.run(
+        f"Here's this channel's recent conversation (latest {settings.initial_history}):"
+        f"\n\n{ctx.deps.conversation}\n\n"
+        "Help them find a good meeting time; if it's not enough to decide, use the "
+        "tools to read further back.",
+        deps=ctx.deps,
+    )
+    return result.output
+
+
+async def respond(
     channel: discord.abc.Messageable,
     trigger_message_id: int,
     initial_conversation: str,
+    asker: str,
+    request: str,
 ) -> str:
-    """Hand the recent conversation to the agent and return suggested meeting times."""
-    deps = MeetingDeps(channel=channel, trigger_message_id=trigger_message_id)
-    result = await meeting_agent.run(
+    """Hand the recent conversation to the assistant and return its reply.
+
+    The assistant chats directly, or calls `plan_meeting` when scheduling is wanted.
+
+    Args:
+        asker: Display name of the person who @-mentioned the bot.
+        request: The exact message they sent (mentions rendered as readable names).
+    """
+    deps = Deps(
+        channel=channel,
+        trigger_message_id=trigger_message_id,
+        conversation=initial_conversation,
+    )
+    history = initial_conversation or "(no earlier messages in this channel)"
+    result = await assistant_agent.run(
         f"Here's this channel's recent conversation (latest {settings.initial_history}):"
-        f"\n\n{initial_conversation}\n\n"
-        "Help us find a good meeting time; if it's not enough to decide, use the tools "
-        "to read further back.",
+        f"\n\n{history}\n\n"
+        f'{asker} just @-mentioned you and said: "{request}"\n'
+        "Reply to them appropriately.",
         deps=deps,
     )
     return result.output
