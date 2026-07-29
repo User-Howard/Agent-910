@@ -28,3 +28,12 @@ Run the container:
 ```bash
 docker run --rm --name MyAgent910 --env-file .env agent-910:latest
 ```
+
+## Deploy
+
+Run `docker compose up -d` once, then add this cron entry to check
+`ghcr.io/user-howard/agent-910:main` every minute:
+
+```cron
+* * * * * cd /home/howard/Documents/Agent-910 && /usr/bin/docker compose up -d --pull always >/dev/null 2>&1
+```
