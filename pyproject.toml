@@ -10,3 +10,8 @@ dependencies = [
     "pydantic-ai>=2.19.0",
     "pydantic-settings>=2.14.2",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.0",
+]
