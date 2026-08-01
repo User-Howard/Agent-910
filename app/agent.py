@@ -6,9 +6,12 @@ just want to chat, and treats scheduling a meeting as *one tool it can call* —
 logic lives in its own sub-agent that the tool runs.
 """
 
+import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
 import discord
+from openai import AsyncOpenAI
 from pydantic_ai import Agent, DocumentUrl, ImageUrl, RunContext
 from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -184,4 +187,39 @@ async def respond(
     files = [ImageUrl(url=a.url) for a in images] + [DocumentUrl(url=a.url) for a in documents]
     user_prompt = [text, *files] if files else text
     result = await assistant_agent.run(user_prompt, deps=deps)
+    return result.output
+
+
+# --- Meeting recording: transcription & summary ---------------------------------
+
+_transcription_client = AsyncOpenAI(base_url=settings.llm.endpoint, api_key=settings.llm.api_key)
+
+summary_agent = Agent(
+    _model,
+    instructions=(
+        "You summarize a meeting transcript. Give a short summary, then the key "
+        "discussion points, decisions made, and action items (who/what, if mentioned). "
+        "Be concise. Reply in the same language as the transcript."
+    ),
+)
+
+
+async def transcribe_audio(data: bytes, filename: str) -> str:
+    """Transcribe raw audio bytes (e.g. an uploaded mp3) to text."""
+    transcript = await _transcription_client.audio.transcriptions.create(
+        model=settings.llm.transcription_model,
+        file=(filename, data),
+    )
+    return transcript.text
+
+
+async def transcribe_meeting(audio_path: Path) -> str:
+    """Transcribe a recorded meeting audio file to text."""
+    data = await asyncio.to_thread(audio_path.read_bytes)
+    return await transcribe_audio(data, audio_path.name)
+
+
+async def summarize_meeting(transcript: str) -> str:
+    """Summarize a meeting transcript: key points, decisions, action items."""
+    result = await summary_agent.run(transcript)
     return result.output

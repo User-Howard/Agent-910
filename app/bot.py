@@ -3,7 +3,7 @@ import shutil
 import discord
 from discord import app_commands
 
-from app.agent import respond
+from app.agent import respond, summarize_meeting, transcribe_audio, transcribe_meeting
 from app.history import fetch_conversation
 from app.recording import RecordingError, start_recording, stop_recording
 from app.settings import settings
@@ -60,9 +60,21 @@ def create_client() -> discord.Client:
             await interaction.followup.send("Recording stopped — nobody's audio was captured.")
             return
 
+        content = "\U0001f6d1 Recording stopped. Here's the meeting audio:"
+        try:
+            transcript = await transcribe_meeting(mixed_path)
+            summary = await summarize_meeting(transcript)
+            content = f"\U0001f6d1 Recording stopped.\n\n{summary}"
+        except Exception as e:  # noqa: BLE001 — a summarization failure shouldn't block the file upload
+            content = f"\U0001f6d1 Recording stopped, but summarizing the audio failed ({e}). Here's the raw audio:"
+
+        # Discord caps message content at 2000 chars; keep the audio file either way.
+        if len(content) > 2000:
+            content = content[:1997] + "..."
+
         try:
             await interaction.followup.send(
-                "\U0001f6d1 Recording stopped. Here's the meeting audio:",
+                content,
                 file=discord.File(mixed_path, filename="meeting.mp3"),
             )
         except discord.HTTPException as e:
@@ -78,6 +90,23 @@ def create_client() -> discord.Client:
             return
 
         if client.user not in message.mentions:
+            return
+
+        audio_attachments = [a for a in message.attachments if (a.content_type or "").startswith("audio/")]
+        if audio_attachments:
+            async with message.channel.typing():
+                summaries = []
+                for attachment in audio_attachments:
+                    try:
+                        data = await attachment.read()
+                        transcript = await transcribe_audio(data, attachment.filename)
+                        summary = await summarize_meeting(transcript)
+                    except Exception as e:  # noqa: BLE001 — report per-file, don't drop the rest
+                        summary = f"Couldn't summarize this one ({e})."
+                    prefix = f"**{attachment.filename}**\n" if len(audio_attachments) > 1 else ""
+                    summaries.append(f"{prefix}{summary}")
+                reply = "\n\n".join(summaries)
+            await message.reply(reply[:2000])
             return
 
         # Feed the last N messages as context; the agent reads further back via tools if needed.

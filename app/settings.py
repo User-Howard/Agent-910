@@ -15,6 +15,7 @@ class LLMSettings(BaseModel):
     endpoint: str = "https://api.openai.com/v1"
     model: AllowedModel = "openai:gpt-5.6-terra"
     api_key: str
+    transcription_model: str = "whisper-1"
 
 
 class Settings(BaseSettings):
