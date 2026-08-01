@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "discord-ext-voice-recv",
     "discord-py>=2.7.1",
     "pydantic>=2.13.4",
     "pydantic-ai>=2.19.0",
@@ -15,3 +16,9 @@ dependencies = [
 dev = [
     "ruff>=0.16.0",
 ]
+
+[tool.uv.sources]
+# PyPI release doesn't decrypt Discord's mandatory DAVE E2EE voice audio on receive
+# (see github.com/imayhaveborkedit/discord-ext-voice-recv/issues/53). This unmerged
+# branch (github.com/.../pull/58) patches exactly that; no official fix is released yet.
+discord-ext-voice-recv = { git = "https://github.com/porgeeratad/discord-ext-voice-recv.git", branch = "dave-decrypt" }
