@@ -97,6 +97,7 @@ def create_client() -> discord.Client:
                 initial,
                 asker=message.author.display_name,
                 request=message.clean_content,
+                attachments=message.attachments,
             )
 
         await message.reply(reply)

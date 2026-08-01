@@ -9,11 +9,11 @@ logic lives in its own sub-agent that the tool runs.
 from dataclasses import dataclass
 
 import discord
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, DocumentUrl, ImageUrl, RunContext
 from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from app.history import fetch_conversation
+from app.history import describe_attachments, fetch_conversation
 from app.settings import settings
 
 # The endpoint decides where requests go (official OpenAI or a gateway proxy).
@@ -140,6 +140,7 @@ async def respond(
     initial_conversation: str,
     asker: str,
     request: str,
+    attachments: list[discord.Attachment] | None = None,
 ) -> str:
     """Hand the recent conversation to the assistant and return its reply.
 
@@ -148,6 +149,9 @@ async def respond(
     Args:
         asker: Display name of the person who @-mentioned the bot.
         request: The exact message they sent (mentions rendered as readable names).
+        attachments: Files on the triggering message. Images and PDFs are sent
+            to the model directly; other file types are only mentioned by
+            name, since the model can't view them.
     """
     deps = Deps(
         channel=channel,
@@ -155,11 +159,29 @@ async def respond(
         conversation=initial_conversation,
     )
     history = initial_conversation or "(no earlier messages in this channel)"
-    result = await assistant_agent.run(
+
+    images: list[discord.Attachment] = []
+    documents: list[discord.Attachment] = []
+    other: list[discord.Attachment] = []
+    for attachment in attachments or []:
+        content_type = attachment.content_type or ""
+        if content_type.startswith("image/"):
+            images.append(attachment)
+        elif content_type == "application/pdf":
+            documents.append(attachment)
+        else:
+            other.append(attachment)
+
+    text = (
         f"Here's this channel's recent conversation (latest {settings.initial_history}):"
         f"\n\n{history}\n\n"
-        f'{asker} just @-mentioned you and said: "{request}"\n'
-        "Reply to them appropriately.",
-        deps=deps,
+        f'{asker} just @-mentioned you and said: "{request}"'
     )
+    if other:
+        text += f"\n{asker} also attached {describe_attachments(other)}, which you can't view directly."
+    text += "\nReply to them appropriately."
+
+    files = [ImageUrl(url=a.url) for a in images] + [DocumentUrl(url=a.url) for a in documents]
+    user_prompt = [text, *files] if files else text
+    result = await assistant_agent.run(user_prompt, deps=deps)
     return result.output
