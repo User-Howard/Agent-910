@@ -1,3 +1,4 @@
+import io
 import shutil
 
 import discord
@@ -61,9 +62,11 @@ def create_client() -> discord.Client:
             return
 
         content = "\U0001f6d1 Recording stopped. Here's the meeting audio:"
+        files = [discord.File(recording.mixed_audio, filename="meeting.mp3")]
         try:
-            summary = await summarize_recording(recording.speakers)
-            content = f"\U0001f6d1 Recording stopped.\n\n{summary}"
+            result = await summarize_recording(recording.speakers)
+            content = f"\U0001f6d1 Recording stopped.\n\n{result.summary}"
+            files.append(discord.File(io.BytesIO(result.transcript.encode()), filename="transcript.txt"))
         except Exception as e:  # noqa: BLE001 — a summarization failure shouldn't block the file upload
             content = f"\U0001f6d1 Recording stopped, but summarizing the audio failed ({e}). Here's the raw audio:"
 
@@ -72,10 +75,7 @@ def create_client() -> discord.Client:
             content = content[:1997] + "..."
 
         try:
-            await interaction.followup.send(
-                content,
-                file=discord.File(recording.mixed_audio, filename="meeting.mp3"),
-            )
+            await interaction.followup.send(content, files=files)
         except discord.HTTPException as e:
             await interaction.followup.send(
                 f"Recording stopped, but the mixed file couldn't be uploaded ({e})."

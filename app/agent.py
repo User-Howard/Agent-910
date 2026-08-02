@@ -213,13 +213,55 @@ async def transcribe_audio(data: bytes, filename: str) -> str:
     return transcript.text
 
 
+async def _compress_for_transcription(audio_path: Path) -> bytes:
+    """Downmix a speaker WAV to mono 16kHz mp3 before sending it to Whisper.
+
+    The raw per-speaker WAVs are 48kHz stereo PCM (~11.5MB/minute), which blows
+    past OpenAI's 25MB transcription upload limit after just a couple of
+    minutes. Speech transcription doesn't need stereo or 48kHz, so compressing
+    first avoids that limit for anything but extremely long recordings.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(audio_path),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "32k",
+        "-f",
+        "mp3",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    data, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Compressing audio for transcription failed: {stderr.decode(errors='replace')[-500:]}")
+    return data
+
+
 async def _transcribe_speaker(name: str, audio_path: Path) -> str:
-    data = await asyncio.to_thread(audio_path.read_bytes)
-    text = await transcribe_audio(data, audio_path.name)
+    data = await _compress_for_transcription(audio_path)
+    text = await transcribe_audio(data, f"{audio_path.stem}.mp3")
     return f"{name}:\n{text}"
 
 
-async def summarize_recording(speakers: list[tuple[str, Path]]) -> str:
+@dataclass
+class MeetingSummary:
+    transcript: str
+    """Full speaker-labeled transcript, e.g. "Alice:\\n...\\n\\nBob:\\n..."."""
+
+    summary: str
+    """The LLM's summary of the transcript."""
+
+
+async def summarize_recording(speakers: list[tuple[str, Path]]) -> MeetingSummary:
     """Summarize a meeting from each speaker's individual (pre-mix) audio file.
 
     Transcribing each speaker separately, rather than the mixed-down track,
@@ -230,7 +272,9 @@ async def summarize_recording(speakers: list[tuple[str, Path]]) -> str:
     labeled_transcripts = await asyncio.gather(
         *[_transcribe_speaker(name, path) for name, path in speakers]
     )
-    return await summarize_meeting("\n\n".join(labeled_transcripts))
+    transcript = "\n\n".join(labeled_transcripts)
+    summary = await summarize_meeting(transcript)
+    return MeetingSummary(transcript=transcript, summary=summary)
 
 
 async def summarize_meeting(transcript: str) -> str:
