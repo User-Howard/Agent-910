@@ -4,7 +4,13 @@ import shutil
 import discord
 from discord import app_commands
 
-from app.agent import respond, summarize_meeting, summarize_recording, transcribe_audio
+from app.agent import (
+    compress_for_transcription,
+    respond,
+    summarize_meeting,
+    summarize_recording,
+    transcribe_audio,
+)
 from app.history import fetch_conversation
 from app.recording import RecordingError, start_recording, stop_recording
 from app.settings import settings
@@ -98,7 +104,8 @@ def create_client() -> discord.Client:
                 for attachment in audio_attachments:
                     try:
                         data = await attachment.read()
-                        transcript = await transcribe_audio(data, attachment.filename)
+                        compressed = await compress_for_transcription(data)
+                        transcript = await transcribe_audio(compressed, f"{attachment.filename}.mp3")
                         summary = await summarize_meeting(transcript)
                     except Exception as e:  # noqa: BLE001 — report per-file, don't drop the rest
                         summary = f"Couldn't summarize this one ({e})."

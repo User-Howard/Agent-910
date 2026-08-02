@@ -226,19 +226,21 @@ async def transcribe_audio(data: bytes, filename: str) -> str:
     return "\n".join(f"[{_format_timestamp(seg.start)}] {seg.text.strip()}" for seg in transcript.segments)
 
 
-async def _compress_for_transcription(audio_path: Path) -> bytes:
-    """Downmix a speaker WAV to mono 16kHz mp3 before sending it to Whisper.
+async def compress_for_transcription(data: bytes) -> bytes:
+    """Downmix arbitrary audio bytes to mono 16kHz mp3 before sending to Whisper.
 
-    The raw per-speaker WAVs are 48kHz stereo PCM (~11.5MB/minute), which blows
-    past OpenAI's 25MB transcription upload limit after just a couple of
-    minutes. Speech transcription doesn't need stereo or 48kHz, so compressing
-    first avoids that limit for anything but extremely long recordings.
+    Raw/lightly-compressed audio (e.g. the recorder's 48kHz stereo per-speaker
+    WAVs, or whatever format a user uploads) can easily blow past OpenAI's
+    25MB transcription upload limit. Speech transcription doesn't need stereo
+    or 48kHz, so compressing first avoids that limit for anything but
+    extremely long audio. ffmpeg auto-detects the input format/codec from the
+    byte stream itself, so this works regardless of the source format.
     """
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-y",
         "-i",
-        str(audio_path),
+        "pipe:0",
         "-ac",
         "1",
         "-ar",
@@ -250,18 +252,20 @@ async def _compress_for_transcription(audio_path: Path) -> bytes:
         "-f",
         "mp3",
         "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    data, stderr = await proc.communicate()
+    out, stderr = await proc.communicate(input=data)
     if proc.returncode != 0:
         raise RuntimeError(f"Compressing audio for transcription failed: {stderr.decode(errors='replace')[-500:]}")
-    return data
+    return out
 
 
 async def _transcribe_speaker(name: str, audio_path: Path) -> str:
-    data = await _compress_for_transcription(audio_path)
-    text = await transcribe_audio(data, f"{audio_path.stem}.mp3")
+    data = await asyncio.to_thread(audio_path.read_bytes)
+    compressed = await compress_for_transcription(data)
+    text = await transcribe_audio(compressed, f"{audio_path.stem}.mp3")
     return f"{name}:\n{text}"
 
 
