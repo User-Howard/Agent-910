@@ -3,7 +3,7 @@ import shutil
 import discord
 from discord import app_commands
 
-from app.agent import respond, summarize_meeting, transcribe_audio, transcribe_meeting
+from app.agent import respond, summarize_meeting, summarize_recording, transcribe_audio
 from app.history import fetch_conversation
 from app.recording import RecordingError, start_recording, stop_recording
 from app.settings import settings
@@ -51,19 +51,18 @@ def create_client() -> discord.Client:
         await interaction.response.defer(thinking=True)
 
         try:
-            mixed_path = await stop_recording(interaction.guild_id)
+            recording = await stop_recording(interaction.guild_id)
         except RecordingError as e:
             await interaction.followup.send(str(e), ephemeral=True)
             return
 
-        if mixed_path is None:
+        if recording is None:
             await interaction.followup.send("Recording stopped — nobody's audio was captured.")
             return
 
         content = "\U0001f6d1 Recording stopped. Here's the meeting audio:"
         try:
-            transcript = await transcribe_meeting(mixed_path)
-            summary = await summarize_meeting(transcript)
+            summary = await summarize_recording(recording.speakers)
             content = f"\U0001f6d1 Recording stopped.\n\n{summary}"
         except Exception as e:  # noqa: BLE001 — a summarization failure shouldn't block the file upload
             content = f"\U0001f6d1 Recording stopped, but summarizing the audio failed ({e}). Here's the raw audio:"
@@ -75,14 +74,14 @@ def create_client() -> discord.Client:
         try:
             await interaction.followup.send(
                 content,
-                file=discord.File(mixed_path, filename="meeting.mp3"),
+                file=discord.File(recording.mixed_audio, filename="meeting.mp3"),
             )
         except discord.HTTPException as e:
             await interaction.followup.send(
                 f"Recording stopped, but the mixed file couldn't be uploaded ({e})."
             )
         finally:
-            shutil.rmtree(mixed_path.parent, ignore_errors=True)
+            shutil.rmtree(recording.mixed_audio.parent, ignore_errors=True)
 
     @client.event
     async def on_message(message: discord.Message):

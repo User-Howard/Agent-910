@@ -213,10 +213,24 @@ async def transcribe_audio(data: bytes, filename: str) -> str:
     return transcript.text
 
 
-async def transcribe_meeting(audio_path: Path) -> str:
-    """Transcribe a recorded meeting audio file to text."""
+async def _transcribe_speaker(name: str, audio_path: Path) -> str:
     data = await asyncio.to_thread(audio_path.read_bytes)
-    return await transcribe_audio(data, audio_path.name)
+    text = await transcribe_audio(data, audio_path.name)
+    return f"{name}:\n{text}"
+
+
+async def summarize_recording(speakers: list[tuple[str, Path]]) -> str:
+    """Summarize a meeting from each speaker's individual (pre-mix) audio file.
+
+    Transcribing each speaker separately, rather than the mixed-down track,
+    means the transcript comes with real speaker attribution — Whisper has no
+    diarization, so a single mixed track would just be "what was said" with no
+    reliable "who said it".
+    """
+    labeled_transcripts = await asyncio.gather(
+        *[_transcribe_speaker(name, path) for name, path in speakers]
+    )
+    return await summarize_meeting("\n\n".join(labeled_transcripts))
 
 
 async def summarize_meeting(transcript: str) -> str:

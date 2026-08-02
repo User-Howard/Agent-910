@@ -74,7 +74,7 @@ class _PerSpeakerWriter(voice_recv.AudioSink):
         self._started_at = time.perf_counter()
         self._lock = threading.Lock()
         self._writers: dict[int, wave.Wave_write] = {}
-        self._paths: list[Path] = []
+        self._names: dict[int, str] = {}
         self._closed = threading.Event()
 
     def wants_opus(self) -> bool:
@@ -96,7 +96,7 @@ class _PerSpeakerWriter(voice_recv.AudioSink):
                 writer.writeframes(b"\0" * silence_bytes)
 
                 self._writers[key] = writer
-                self._paths.append(path)
+                self._names[key] = user.display_name if user is not None else f"Unknown speaker {key}"
             writer.writeframes(data.pcm)
 
     def cleanup(self) -> None:
@@ -114,8 +114,9 @@ class _PerSpeakerWriter(voice_recv.AudioSink):
         await loop.run_in_executor(None, self._closed.wait, timeout)
 
     @property
-    def speaker_files(self) -> list[Path]:
-        return list(self._paths)
+    def speakers(self) -> list[tuple[str, Path]]:
+        """Each speaker's display name and their individual (pre-mix) WAV file."""
+        return [(self._names[key], self._directory / f"{key}.wav") for key in self._writers]
 
 
 @dataclass
@@ -124,6 +125,17 @@ class RecordingSession:
     directory: Path
     sink: _PerSpeakerWriter
     started_by: str
+
+
+@dataclass
+class MeetingRecording:
+    mixed_audio: Path
+    """The full meeting, all speakers combined into one track."""
+
+    speakers: list[tuple[str, Path]]
+    """Each speaker's display name and their individual (pre-mix) WAV file —
+    useful for transcribing per-speaker instead of the mixed track. Deleted
+    along with `mixed_audio.parent` once the caller is done with them."""
 
 
 _sessions: dict[int, RecordingSession] = {}
@@ -149,8 +161,8 @@ async def start_recording(channel: discord.VoiceChannel, *, started_by: str) -> 
     return session
 
 
-async def stop_recording(guild_id: int) -> Path | None:
-    """Stop the recording for a guild and return the path to the mixed mp3.
+async def stop_recording(guild_id: int) -> MeetingRecording | None:
+    """Stop the recording for a guild and return the mixed audio + per-speaker files.
 
     Returns None if nobody's audio was actually captured. Raises RecordingError
     if there's no active recording, or if mixing the audio fails.
@@ -168,18 +180,18 @@ async def stop_recording(guild_id: int) -> Path | None:
     session.sink.cleanup()
     await session.voice_client.disconnect(force=False)
 
-    speaker_files = session.sink.speaker_files
-    if not speaker_files:
+    speakers = session.sink.speakers
+    if not speakers:
         shutil.rmtree(session.directory, ignore_errors=True)
         return None
 
     output = session.directory / "meeting.mp3"
     try:
-        await _mix_to_mp3(speaker_files, output)
+        await _mix_to_mp3([path for _, path in speakers], output)
     except Exception:
         shutil.rmtree(session.directory, ignore_errors=True)
         raise
-    return output
+    return MeetingRecording(mixed_audio=output, speakers=speakers)
 
 
 async def _mix_to_mp3(speaker_files: list[Path], output: Path) -> None:
