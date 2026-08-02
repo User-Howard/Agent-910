@@ -204,13 +204,26 @@ summary_agent = Agent(
 )
 
 
+def _format_timestamp(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
 async def transcribe_audio(data: bytes, filename: str) -> str:
-    """Transcribe raw audio bytes (e.g. an uploaded mp3) to text."""
+    """Transcribe raw audio bytes (e.g. an uploaded mp3) to text.
+
+    Each line is prefixed with a [MM:SS] timestamp of when it was said,
+    relative to the start of the audio file.
+    """
     transcript = await _transcription_client.audio.transcriptions.create(
         model=settings.llm.transcription_model,
         file=(filename, data),
+        response_format="verbose_json",
+        timestamp_granularities=["segment"],
     )
-    return transcript.text
+    if not transcript.segments:
+        return transcript.text
+    return "\n".join(f"[{_format_timestamp(seg.start)}] {seg.text.strip()}" for seg in transcript.segments)
 
 
 async def _compress_for_transcription(audio_path: Path) -> bytes:
