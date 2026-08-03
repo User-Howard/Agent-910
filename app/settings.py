@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ValidationError
@@ -30,6 +31,15 @@ class Settings(BaseSettings):
     llm: LLMSettings
 
     initial_history: int = 10
+
+    timezone: str = "Asia/Taipei"
+    """The timezone people are speaking in. Times are stored as UTC and shown in this."""
+
+    default_meeting_minutes: int = 60
+    """How long a meeting is assumed to be when nobody says otherwise."""
+
+    data_dir: Path = Path("data")
+    """Where meetings.db lives — everyone's stated availability, kept across restarts."""
 
 
 def load_settings() -> Settings:
