@@ -32,6 +32,10 @@ RUN groupadd --system --gid 999 nonroot \
 
 COPY --from=builder --chown=nonroot:nonroot /app /app
 
+# meetings.db lives here. Creating it up front (and nonroot-owned) means a volume
+# mounted over it inherits that ownership and stays writable.
+RUN install -d -o nonroot -g nonroot /app/data
+
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 

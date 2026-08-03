@@ -90,3 +90,5 @@ venv/
 
 # Ruff stuff:
 .ruff_cache/
+
+data/

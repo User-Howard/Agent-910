@@ -3,3 +3,11 @@ services:
     image: ghcr.io/user-howard/agent-910:main
     env_file: .env
     restart: unless-stopped
+    volumes:
+      # Holds meetings.db — everyone's stated availability. A named volume rather than
+      # a bind mount, so it inherits the image's nonroot ownership instead of being
+      # created root-owned and unwritable.
+      - agent-data:/app/data
+
+volumes:
+  agent-data:
