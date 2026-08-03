@@ -11,6 +11,7 @@ from app.agent import (
     summarize_recording,
     transcribe_audio,
 )
+from app.confirm import ConfirmTimeView
 from app.history import fetch_conversation
 from app.recording import RecordingError, start_recording, stop_recording
 from app.settings import settings
@@ -133,9 +134,32 @@ def create_client() -> discord.Client:
                 asker=message.author.display_name,
                 request=message.clean_content,
                 attachments=message.attachments,
+                channel_id=message.channel.id,
             )
 
-        await message.reply(reply)
+        # A plain chat reply is just text. A scheduling reply also carries the
+        # availability chart and the times to confirm, which Discord renders far
+        # better than prose can — the chart as a code block, the times as buttons.
+        extras = "\n".join(
+            filter(
+                None,
+                [
+                    reply.chart or "",
+                    *(f"**{p.slot.label()}** — {p.reason}" for p in reply.proposals),
+                ],
+            )
+        )
+        if extras:
+            # Trim the prose rather than the chart, so its code block always closes.
+            room = 2000 - len(extras) - 1
+            content = f"{reply.text[:room]}\n{extras}" if room > 0 else extras[:2000]
+        else:
+            content = reply.text[:2000]
+
+        view = ConfirmTimeView(reply.proposals, topic=reply.topic, meeting_id=reply.meeting_id) if reply.proposals else None
+        sent = await message.reply(content, view=view)
+        if view is not None:
+            view.message = sent
 
     return client
 

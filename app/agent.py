@@ -7,15 +7,19 @@ logic lives in its own sub-agent that the tool runs.
 """
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent, DocumentUrl, ImageUrl, RunContext
 from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from app import availability
 from app.history import describe_attachments, fetch_conversation
 from app.settings import settings
 
@@ -32,6 +36,14 @@ _model = OpenAIResponsesModel(
 )
 
 
+@dataclass(frozen=True)
+class Proposal:
+    """One concrete time the agent is putting to the group for confirmation."""
+
+    slot: availability.Slot
+    reason: str
+
+
 @dataclass
 class Deps:
     """Dependencies shared by a single agent run and any sub-agents it calls."""
@@ -39,25 +51,114 @@ class Deps:
     channel: discord.abc.Messageable  # lets tools read further back in the conversation
     trigger_message_id: int  # the message that triggered the bot; skip it when reading
     conversation: str  # the recent conversation the bot started with
+    channel_id: int = 0  # scopes the meeting being tracked to this channel
+
+    # The message that triggered the bot, kept apart from `conversation` because it's
+    # excluded from the history fetch. Sub-agents need it too: someone who writes
+    # "@bot 我週五下午可以，幫忙喬一下" is stating their availability *in* the trigger,
+    # and dropping it would leave their answer unseen until the next turn.
+    asker: str = ""
+    request: str = ""
+
+    # Filled in by the meeting tools below. The agent can only reply in text, but
+    # Discord can do better than text — so what it *found* is collected here and
+    # posted by the bot as a chart plus real confirmation buttons.
+    chart: str | None = None
+    proposals: list[Proposal] = field(default_factory=list)
+    meeting_id: int | None = None
+    topic: str = "Meeting"
 
 
 # --- Meeting-planning sub-agent -------------------------------------------------
 # Only reached when the assistant decides scheduling is actually wanted.
+#
+# The division of labour matters here. Turning "我週三下午跟週五整天都可以" into concrete
+# timestamps is a language problem, and the model is the only thing that can do it — so
+# that's all it's asked to do. Remembering the answers, telling "hasn't replied" apart
+# from "can't make it", and intersecting everyone's windows are all things a model does
+# unreliably and SQL does exactly, so those live in `app.availability` instead.
 
 meeting_agent = Agent(
     _model,
     deps_type=Deps,
     instructions=(
-        "You help a team schedule a meeting from their chat. Figure out the topic, "
-        "who's involved, and any time preferences.\n"
-        "You start with the recent conversation you're given. If that's not enough, call "
-        "`read_more_messages` to read a bit further back — just enough, not too much.\n"
-        "Once you have a time range, call `find_free_slots` for everyone's common "
-        "availability, then suggest 2-3 concrete times with a short reason each. "
-        "Reply in the same language as the conversation. If info is missing, say what's "
-        "missing instead of guessing."
+        "You help a group in a Discord channel settle on a meeting time, by reading what "
+        "they say in chat and keeping a running record of it.\n"
+        "\n"
+        "WORKFLOW\n"
+        "1. Call `open_meeting` first, always. It gives you the topic, the length, and "
+        "everything already on record from earlier messages — including who still hasn't "
+        "answered. Never assume the record is empty.\n"
+        "2. Call `record_availability` only for people this conversation says something "
+        "NEW about. If someone's answer is already on record and they haven't spoken "
+        "since, leave them alone — re-recording them from memory is how answers get "
+        "quietly lost.\n"
+        "   When you do record someone, give their COMPLETE availability, not just the "
+        "part they mentioned most recently: the call replaces everything they said "
+        "before. Narrowing someone's windows means they withdrew that time, so only do "
+        "it if they actually did.\n"
+        "3. Call `review` to get the recomputed overlap. Do not work the overlap out "
+        "yourself; you will get it wrong at the edges.\n"
+        "4. If `review` shows times that work for everyone who answered, call "
+        "`propose_times` with the best 2-3. The bot turns them into buttons.\n"
+        "\n"
+        "READING TIMES\n"
+        "- Resolve relative dates against today's date, given below. '這週三' is the "
+        "Wednesday of the current week; if that day has passed, they mean next week.\n"
+        "- Convert vague spans conservatively: '下午' is 13:00-18:00, '晚上' is "
+        "18:00-22:00, '早上' is 09:00-12:00, '整天' is 09:00-22:00.\n"
+        "- Negative and open-ended answers still carry real information. '我週三 2 點後"
+        "不行，其他時間都可以' means free until 14:00 on Wednesday AND free on every other "
+        "day being discussed. Give them a window on each of those days — dropping them "
+        "makes that person look unavailable when they said the opposite.\n"
+        "- The days 'being discussed' are the ones already in the record. `open_meeting` "
+        "shows you them; cover those, and don't invent days nobody has raised.\n"
+        "\n"
+        "STATUS — this distinction is the point of the record, so be strict:\n"
+        "- 'stated' only when they gave times you can pin to a clock. Windows required.\n"
+        "- 'tentative' for real but non-committal answers ('還不確定', '看情況', '應該可以"
+        "吧'). No windows. Their name still shows as outstanding.\n"
+        "- 'unavailable' when they're out entirely.\n"
+        "Never upgrade a vague answer to 'stated' by guessing what they probably meant.\n"
+        "\n"
+        "Reply in the same language as the conversation, briefly. If people are still "
+        "outstanding, say who — `review` tells you. Don't re-list the proposed times in "
+        "prose; the buttons already show them."
     ),
 )
+
+
+@meeting_agent.instructions
+def _today(ctx: RunContext[Deps]) -> str:
+    """Tell the model what "now" is, so relative dates resolve correctly.
+
+    Injected per run rather than baked into the static prompt: a long-lived process
+    would otherwise keep resolving "這週三" against the day it booted.
+    """
+    now = datetime.now(tz=ZoneInfo(settings.timezone))
+    return f"Today is {now:%Y-%m-%d (%A)}, current time {now:%H:%M}, timezone {settings.timezone}."
+
+
+class FreeWindow(BaseModel):
+    """One stretch of time a person said they're free."""
+
+    start: str = Field(description="Start, ISO 8601 local time, e.g. 2026-08-05T13:00:00.")
+    end: str = Field(description="End, ISO 8601 local time, e.g. 2026-08-05T18:00:00.")
+
+
+class Candidate(BaseModel):
+    """A time the agent wants the group to confirm."""
+
+    start: str = Field(description="When it starts, ISO 8601, e.g. 2026-08-05T14:00:00.")
+    reason: str = Field(description="One short line on why this time is a good pick.")
+
+
+def _to_local(value: str) -> datetime:
+    """Read an ISO 8601 time from the model, assuming local time when it omits a zone."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=ZoneInfo(settings.timezone))
+    return parsed.astimezone(ZoneInfo(settings.timezone))
 
 
 @meeting_agent.tool
@@ -78,26 +179,115 @@ async def read_more_messages(ctx: RunContext[Deps], limit: int) -> str:
 
 
 @meeting_agent.tool
-async def find_free_slots(
+async def open_meeting(
     ctx: RunContext[Deps],
-    earliest: str,
-    latest: str,
-    duration_minutes: int,
+    topic: str,
+    participants: list[str],
+    duration_minutes: int | None = None,
 ) -> str:
-    """Find everyone's common free slots within a time range.
+    """Start or resume tracking this channel's meeting, and read back what's known.
+
+    Call this before anything else. If the channel already has a meeting in progress
+    this resumes it, so earlier answers are not lost.
 
     Args:
-        earliest: Earliest possible meeting time (ISO 8601, e.g. 2026-07-29T09:00:00).
-        latest: Latest the meeting should end (ISO 8601).
-        duration_minutes: Meeting length in minutes.
+        topic: What the meeting is about, in a few words.
+        participants: Everyone expected to attend, by the display name they use in chat.
+            Listing someone who already answered is harmless.
+        duration_minutes: How long it should be. Omit unless someone said.
     """
-    # TODO: hook up Google Calendar and return real availability.
-    # Placeholder for now so the whole agent flow can run end to end.
-    return (
-        f"(Google Calendar not connected yet, fake data) Common free slots between "
-        f"{earliest} and {latest} for {duration_minutes} minutes: "
-        f"7/29 14:00–15:00, 7/30 10:00–11:00."
-    )
+    duration = duration_minutes or settings.default_meeting_minutes
+    meeting = availability.open_meeting(ctx.deps.channel_id, topic, duration)
+    availability.retopic(meeting.id, topic, duration)
+    availability.note_participants(meeting.id, participants)
+
+    ctx.deps.meeting_id = meeting.id
+    ctx.deps.topic = topic
+    return f"Meeting #{meeting.id}: {topic}, {duration} min.\nOn record:\n{availability.describe(meeting.id)}"
+
+
+@meeting_agent.tool
+async def record_availability(
+    ctx: RunContext[Deps],
+    person: str,
+    status: str,
+    windows: list[FreeWindow] | None = None,
+    note: str = "",
+) -> str:
+    """Write down when one person said they're free. Replaces their previous answer.
+
+    Args:
+        person: Their display name, exactly as it appears in the chat.
+        status: One of "stated" (gave real times), "tentative" (non-committal),
+            "unavailable" (can't attend at all).
+        windows: The times they're free. Required for "stated", omitted otherwise.
+        note: Their own words, when the status alone loses something worth keeping.
+    """
+    if ctx.deps.meeting_id is None:
+        return "Call `open_meeting` first."
+    if status not in {availability.STATED, availability.TENTATIVE, availability.UNAVAILABLE}:
+        return f"'{status}' isn't a status. Use stated, tentative or unavailable."
+    if status == availability.STATED and not windows:
+        return f"'stated' needs windows. If {person} was vague, record them as tentative."
+
+    try:
+        parsed = [
+            availability.Window(start=_to_local(w.start), end=_to_local(w.end))
+            for w in windows or []
+        ]
+    except ValueError as e:
+        return f"Couldn't read those times ({e}) — use ISO 8601 like 2026-08-05T14:00:00."
+    if any(w.end <= w.start for w in parsed):
+        return "Each window must end after it starts."
+
+    availability.record(ctx.deps.meeting_id, person, status, parsed, note)
+    return f"Recorded {person} as {status}."
+
+
+@meeting_agent.tool
+async def review(ctx: RunContext[Deps]) -> str:
+    """Recompute and read back the overlap, plus who's still outstanding.
+
+    This is the authority on what works for whom — it intersects the recorded windows
+    exactly, and skips anything in the past. It also builds the chart the bot posts.
+    """
+    if ctx.deps.meeting_id is None:
+        return "Call `open_meeting` first."
+    ctx.deps.chart = availability.render_heatmap(ctx.deps.meeting_id)
+    return availability.describe(ctx.deps.meeting_id)
+
+
+@meeting_agent.tool
+async def propose_times(ctx: RunContext[Deps], candidates: list[Candidate]) -> str:
+    """Put 2-3 candidate times to the group as confirmation buttons.
+
+    Only propose times `review` showed as working for everyone who answered — or, if
+    nothing does, the best available, saying so in your reply.
+
+    Args:
+        candidates: The times to offer, best first.
+    """
+    if ctx.deps.meeting_id is None:
+        return "Call `open_meeting` first."
+
+    meeting = availability.current_meeting(ctx.deps.channel_id)
+    duration = timedelta(minutes=meeting.duration_minutes if meeting else settings.default_meeting_minutes)
+
+    proposals = []
+    for candidate in candidates:
+        try:
+            start = _to_local(candidate.start)
+        except ValueError as e:
+            return f"Couldn't read '{candidate.start}' ({e}) — use ISO 8601."
+        proposals.append(
+            Proposal(
+                slot=availability.Slot(start=start, end=start + duration, who=[]),
+                reason=candidate.reason,
+            )
+        )
+
+    ctx.deps.proposals = proposals
+    return f"Offering {len(proposals)} times for confirmation."
 
 
 # --- Top-level conversational assistant ----------------------------------------
@@ -129,12 +319,26 @@ async def plan_meeting(ctx: RunContext[Deps]) -> str:
     """
     result = await meeting_agent.run(
         f"Here's this channel's recent conversation (latest {settings.initial_history}):"
-        f"\n\n{ctx.deps.conversation}\n\n"
+        f"\n\n{ctx.deps.conversation}\n"
+        f"{ctx.deps.asker}: {ctx.deps.request}\n\n"
+        "That last line is the message that just triggered you — treat it as part of the "
+        "conversation, including any availability it states.\n"
         "Help them find a good meeting time; if it's not enough to decide, use the "
         "tools to read further back.",
         deps=ctx.deps,
     )
     return result.output
+
+
+@dataclass
+class Reply:
+    """What the bot should post: the assistant's text, plus anything Discord can render."""
+
+    text: str
+    chart: str | None = None
+    proposals: list[Proposal] = field(default_factory=list)
+    topic: str = "Meeting"
+    meeting_id: int | None = None
 
 
 async def respond(
@@ -144,8 +348,9 @@ async def respond(
     asker: str,
     request: str,
     attachments: list[discord.Attachment] | None = None,
-) -> str:
-    """Hand the recent conversation to the assistant and return its reply.
+    channel_id: int = 0,
+) -> Reply:
+    """Hand the recent conversation to the assistant and return what to post.
 
     The assistant chats directly, or calls `plan_meeting` when scheduling is wanted.
 
@@ -155,11 +360,15 @@ async def respond(
         attachments: Files on the triggering message. Images and PDFs are sent
             to the model directly; other file types are only mentioned by
             name, since the model can't view them.
+        channel_id: Scopes the tracked meeting to this channel.
     """
     deps = Deps(
         channel=channel,
         trigger_message_id=trigger_message_id,
         conversation=initial_conversation,
+        channel_id=channel_id,
+        asker=asker,
+        request=request,
     )
     history = initial_conversation or "(no earlier messages in this channel)"
 
@@ -187,7 +396,13 @@ async def respond(
     files = [ImageUrl(url=a.url) for a in images] + [DocumentUrl(url=a.url) for a in documents]
     user_prompt = [text, *files] if files else text
     result = await assistant_agent.run(user_prompt, deps=deps)
-    return result.output
+    return Reply(
+        text=result.output,
+        chart=deps.chart,
+        proposals=deps.proposals,
+        topic=deps.topic,
+        meeting_id=deps.meeting_id,
+    )
 
 
 # --- Meeting recording: transcription & summary ---------------------------------
