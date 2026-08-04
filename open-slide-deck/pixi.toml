@@ -1,0 +1,16 @@
+[workspace]
+authors = ["Hao-wei Wu <60650989+User-Howard@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "open-slide-deck"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+install = "pnpm install"
+dev = { cmd = "pnpm dev", depends-on = ["install"] }
+build = { cmd = "pnpm build", depends-on = ["install"] }
+preview = { cmd = "pnpm preview", depends-on = ["install"] }
+
+[dependencies]
+nodejs = ">=26.5.1,<26.6"
+pnpm = ">=11.20.0,<12"
