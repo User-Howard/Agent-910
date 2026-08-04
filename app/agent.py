@@ -20,6 +20,7 @@ from pydantic_ai.models.openai import OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from app import availability
+from app.calendar_delivery import CalendarDelivery, prepare_calendar_delivery
 from app.history import describe_attachments, fetch_conversation
 from app.settings import settings
 
@@ -67,6 +68,7 @@ class Deps:
     proposals: list[Proposal] = field(default_factory=list)
     meeting_id: int | None = None
     topic: str = "Meeting"
+    calendar_delivery: CalendarDelivery | None = None
 
 
 # --- Meeting-planning sub-agent -------------------------------------------------
@@ -97,9 +99,12 @@ meeting_agent = Agent(
         "part they mentioned most recently: the call replaces everything they said "
         "before. Narrowing someone's windows means they withdrew that time, so only do "
         "it if they actually did.\n"
-        "3. Call `review` to get the recomputed overlap. Do not work the overlap out "
+        "3. If the request already gives a fixed meeting date/time and duration, call "
+        "`confirm_meeting_time` after `open_meeting`. Do not call `review` or "
+        "`propose_times` for an already-confirmed time.\n"
+        "4. Otherwise, call `review` to get the recomputed overlap. Do not work the overlap out "
         "yourself; you will get it wrong at the edges.\n"
-        "4. If `review` shows times that work for everyone who answered, call "
+        "5. If `review` shows times that work for everyone who answered, call "
         "`propose_times` with the best 2-3. The bot turns them into buttons.\n"
         "\n"
         "READING TIMES\n"
@@ -151,6 +156,14 @@ class Candidate(BaseModel):
 
     start: str = Field(description="When it starts, ISO 8601, e.g. 2026-08-05T14:00:00.")
     reason: str = Field(description="One short line on why this time is a good pick.")
+
+
+class ConfirmedTime(BaseModel):
+    """A meeting time the user has already decided."""
+
+    start: str = Field(description="When it starts, ISO 8601, e.g. 2026-08-05T14:00:00.")
+    duration_minutes: int = Field(description="How long the meeting lasts.")
+    confirmed_by: str = Field(description="Who confirmed or requested this time.")
 
 
 def _to_local(value: str) -> datetime:
@@ -290,6 +303,52 @@ async def propose_times(ctx: RunContext[Deps], candidates: list[Candidate]) -> s
     return f"Offering {len(proposals)} times for confirmation."
 
 
+@meeting_agent.tool
+async def confirm_meeting_time(ctx: RunContext[Deps], confirmed: ConfirmedTime) -> str:
+    """Settle an already-decided meeting time and send Google Calendar invites.
+
+    Use this when the user gives the meeting's exact date/time, duration, and
+    participants in the request. Call `open_meeting` first so the participant list
+    exists in the meeting record.
+
+    Args:
+        confirmed: The fixed meeting start, duration, and confirmer.
+    """
+    if ctx.deps.meeting_id is None:
+        return "Call `open_meeting` first."
+    if confirmed.duration_minutes <= 0:
+        return "duration_minutes must be positive."
+
+    try:
+        start = _to_local(confirmed.start)
+    except ValueError as e:
+        return f"Couldn't read '{confirmed.start}' ({e}) — use ISO 8601."
+
+    end = start + timedelta(minutes=confirmed.duration_minutes)
+    availability.retopic(ctx.deps.meeting_id, ctx.deps.topic, confirmed.duration_minutes)
+    availability.settle(ctx.deps.meeting_id, start, confirmed.confirmed_by)
+    proposal = Proposal(
+        slot=availability.Slot(start=start, end=end, who=[]),
+        reason="The requester gave this as the confirmed meeting time.",
+    )
+    description = (
+        f"Confirmed by {confirmed.confirmed_by} via Discord. "
+        "The requester gave this as the confirmed meeting time."
+    )
+    ctx.deps.calendar_delivery = await prepare_calendar_delivery(
+        meeting_id=ctx.deps.meeting_id,
+        start=proposal.slot.start,
+        end=proposal.slot.end,
+        topic=ctx.deps.topic,
+        description=description,
+        organizer=confirmed.confirmed_by,
+    )
+    return (
+        f"Confirmed {ctx.deps.topic} for {proposal.slot.label()}."
+        f"{ctx.deps.calendar_delivery.note}"
+    )
+
+
 # --- Top-level conversational assistant ----------------------------------------
 
 assistant_agent = Agent(
@@ -317,17 +376,45 @@ async def plan_meeting(ctx: RunContext[Deps]) -> str:
     It reads the conversation (and further back if needed), checks availability, and
     returns concrete suggested times. Returns that suggestion as text.
     """
+    return await _run_meeting_agent(ctx.deps)
+
+
+async def _run_meeting_agent(deps: Deps) -> str:
+    """Run the scheduling agent directly for meeting/calendar requests."""
     result = await meeting_agent.run(
         f"Here's this channel's recent conversation (latest {settings.initial_history}):"
-        f"\n\n{ctx.deps.conversation}\n"
-        f"{ctx.deps.asker}: {ctx.deps.request}\n\n"
+        f"\n\n{deps.conversation}\n"
+        f"{deps.asker}: {deps.request}\n\n"
         "That last line is the message that just triggered you — treat it as part of the "
         "conversation, including any availability it states.\n"
-        "Help them find a good meeting time; if it's not enough to decide, use the "
-        "tools to read further back.",
-        deps=ctx.deps,
+        "If it asks to directly create a Google Calendar event, invite attendees, or "
+        "says the meeting time is already confirmed, this is a meeting request. If it "
+        "gives a fixed date/time and duration, call `open_meeting`, then "
+        "`confirm_meeting_time`. Otherwise help them find a good meeting time; if it's "
+        "not enough to decide, use the tools to read further back.",
+        deps=deps,
     )
     return result.output
+
+
+def _looks_like_meeting_request(text: str) -> bool:
+    """Cheap routing guard so direct calendar requests don't get answered as chat."""
+    lowered = text.casefold()
+    strong = [
+        "google calendar",
+        "calendar 活動",
+        "行事曆",
+        "邀請",
+        "建立活動",
+        "直接建立",
+        "會議已確定",
+        "已確定",
+    ]
+    meeting = ["meeting", "會議", "開會", "辦一個meeting", "schedule", "安排"]
+    timeish = ["時間", "持續", "分鐘", "am", "pm", "台北時間", "202"]
+    return any(token in lowered for token in strong) or (
+        any(token in lowered for token in meeting) and any(token in lowered for token in timeish)
+    )
 
 
 @dataclass
@@ -339,6 +426,7 @@ class Reply:
     proposals: list[Proposal] = field(default_factory=list)
     topic: str = "Meeting"
     meeting_id: int | None = None
+    calendar_delivery: CalendarDelivery | None = None
 
 
 async def respond(
@@ -394,14 +482,19 @@ async def respond(
     text += "\nReply to them appropriately."
 
     files = [ImageUrl(url=a.url) for a in images] + [DocumentUrl(url=a.url) for a in documents]
-    user_prompt = [text, *files] if files else text
-    result = await assistant_agent.run(user_prompt, deps=deps)
+    if not files and _looks_like_meeting_request(request):
+        output = await _run_meeting_agent(deps)
+    else:
+        user_prompt = [text, *files] if files else text
+        result = await assistant_agent.run(user_prompt, deps=deps)
+        output = result.output
     return Reply(
-        text=result.output,
+        text=output,
         chart=deps.chart,
         proposals=deps.proposals,
         topic=deps.topic,
         meeting_id=deps.meeting_id,
+        calendar_delivery=deps.calendar_delivery,
     )
 
 

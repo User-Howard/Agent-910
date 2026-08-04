@@ -8,13 +8,11 @@ Settling also closes the meeting in the record, so the next scheduling request i
 channel starts clean instead of inheriting these answers.
 """
 
-import io
-
 import discord
 
 from app import availability
 from app.agent import Proposal
-from app.invite import build_ics, filename_for
+from app.calendar_delivery import prepare_calendar_delivery
 
 _CONFIRM_TIMEOUT = 60 * 60 * 24  # a day to decide; after that the buttons go quiet
 
@@ -62,19 +60,20 @@ class _ConfirmButton(discord.ui.Button):
         if self.meeting_id is not None:
             availability.settle(self.meeting_id, self.proposal.slot.start, who)
 
-        # The .ics needs no credentials and nobody's email address, so this is the one
-        # path onto people's calendars that always works.
-        ics = build_ics(
+        description = f"Confirmed by {who} via Discord. {self.proposal.reason}".strip()
+        delivery = await prepare_calendar_delivery(
+            meeting_id=self.meeting_id,
             start=self.proposal.slot.start,
             end=self.proposal.slot.end,
-            summary=self.topic,
-            description=f"Confirmed by {who} via Discord. {self.proposal.reason}".strip(),
+            topic=self.topic,
+            description=description,
             organizer=who,
         )
+
         await interaction.followup.send(
             f"✅ **{self.topic}** is set for **{self.proposal.slot.label()}** "
-            f"(confirmed by {who}).\nAdd it to your calendar with the file below.",
-            file=discord.File(io.BytesIO(ics), filename=filename_for(self.topic)),
+            f"(confirmed by {who}).{delivery.note}\nAdd it to your calendar with the file below.",
+            file=delivery.discord_file(),
         )
 
 

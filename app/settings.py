@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AllowedModel = Literal[
@@ -17,6 +17,17 @@ class LLMSettings(BaseModel):
     model: AllowedModel = "openai:gpt-5.6-terra"
     api_key: str
     transcription_model: str = "whisper-1"
+
+
+class GoogleCalendarSettings(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+    refresh_token: str = ""
+    calendar_id: str = "primary"
+
+    @property
+    def enabled(self) -> bool:
+        return all([self.client_id, self.client_secret, self.refresh_token])
 
 
 class Settings(BaseSettings):
@@ -40,6 +51,9 @@ class Settings(BaseSettings):
 
     data_dir: Path = Path("data")
     """Where meetings.db lives — everyone's stated availability, kept across restarts."""
+
+    google_calendar: GoogleCalendarSettings = Field(default_factory=GoogleCalendarSettings)
+    """OAuth credentials for the logged-in Google account that creates events."""
 
 
 def load_settings() -> Settings:

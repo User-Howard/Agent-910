@@ -43,7 +43,19 @@ bot:    Alice、Bob、Howard 的時間能配合，Carol 還要等打工班表確
 > `[08/07 (Fri) 13:00-14:00]` `[08/07 (Fri) 14:00-15:00]` `[None of these]`
 
 Clicking a button settles it and posts an `.ics` — one click to add it to Google
-Calendar, Apple Calendar or Outlook. No credentials and nobody's email address needed.
+Calendar, Apple Calendar or Outlook. If Google Calendar OAuth is configured and
+participants have registered Google Calendar emails, the bot also creates a Google
+Calendar event from the logged-in account and sends attendee invites. Google Workspace
+addresses, such as company `edu.tw` accounts, work here too.
+
+Participants can manage their invite address with slash commands:
+
+```text
+/gmail name@company.edu.tw
+/mygmail
+/forgetgmail
+/test_google_calendar_api
+```
 
 ### How the work is split
 
@@ -74,6 +86,13 @@ cp .env.example .env
 DISCORD_TOKEN=your_discord_bot_token
 LLM__API_KEY=your_llm_api_key
 TIMEZONE=Asia/Taipei   # optional; the timezone people are speaking in
+
+# Optional: create real Google Calendar events when a time is confirmed.
+# The refresh token must include calendar event access for the logged-in account.
+GOOGLE_CALENDAR__CLIENT_ID=your_google_oauth_client_id
+GOOGLE_CALENDAR__CLIENT_SECRET=your_google_oauth_client_secret
+GOOGLE_CALENDAR__REFRESH_TOKEN=refresh_token_for_the_logged_in_google_account
+GOOGLE_CALENDAR__CALENDAR_ID=primary
 ```
 
 ## Run with Docker
