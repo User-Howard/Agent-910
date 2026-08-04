@@ -1,3 +1,4 @@
+import asyncio
 import io
 import shutil
 
@@ -12,9 +13,11 @@ from app.agent import (
     transcribe_audio,
 )
 from app.confirm import ConfirmTimeView
+from app.google_calendar import test_calendar_api
 from app.history import fetch_conversation
 from app.recording import RecordingError, start_recording, stop_recording
 from app.settings import settings
+from app.users import forget_gmail, gmail_for_discord_user, save_gmail
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -90,6 +93,62 @@ def create_client() -> discord.Client:
         finally:
             shutil.rmtree(recording.mixed_audio.parent, ignore_errors=True)
 
+    @tree.command(name="gmail", description="Save the Google Calendar email that should receive meeting invites.")
+    @app_commands.describe(email="Your Google Calendar email, e.g. name@company.edu.tw")
+    async def gmail(interaction: discord.Interaction, email: str):
+        try:
+            record = save_gmail(interaction.user.id, interaction.user.display_name, email)
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Saved **{record.gmail}** for Google Calendar meeting invites.",
+            ephemeral=True,
+        )
+
+    @tree.command(name="mygmail", description="Show the Google Calendar email saved for meeting invites.")
+    async def mygmail(interaction: discord.Interaction):
+        record = gmail_for_discord_user(interaction.user.id)
+        if record is None:
+            await interaction.response.send_message(
+                "No Google Calendar email is saved yet. Use `/gmail` to register one.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"Meeting invites will go to **{record.gmail}**.",
+            ephemeral=True,
+        )
+
+    @tree.command(name="forgetgmail", description="Remove your saved Google Calendar email.")
+    async def forgetgmail(interaction: discord.Interaction):
+        removed = forget_gmail(interaction.user.id)
+        await interaction.response.send_message(
+            "Removed your saved Google Calendar email."
+            if removed
+            else "No Google Calendar email was saved for your account.",
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="test_google_calendar_api",
+        description="Test OAuth and read access for the configured Google Calendar.",
+    )
+    async def test_google_calendar_api_command(interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            health = await asyncio.to_thread(test_calendar_api)
+        except Exception as e:  # noqa: BLE001 — show config/API detail to the operator
+            await interaction.followup.send(f"Google Calendar API test failed: {e}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            "Google Calendar API is available.\n"
+            f"Calendar: **{health.summary}**\n"
+            f"Calendar ID: `{health.calendar_id}`\n"
+            f"Timezone: `{health.timezone}`",
+            ephemeral=True,
+        )
+
     @client.event
     async def on_message(message: discord.Message):
         if message.author == client.user:
@@ -157,7 +216,8 @@ def create_client() -> discord.Client:
             content = reply.text[:2000]
 
         view = ConfirmTimeView(reply.proposals, topic=reply.topic, meeting_id=reply.meeting_id) if reply.proposals else None
-        sent = await message.reply(content, view=view)
+        file = reply.calendar_delivery.discord_file() if reply.calendar_delivery else None
+        sent = await message.reply(content, view=view, file=file)
         if view is not None:
             view.message = sent
 
